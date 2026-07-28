@@ -8,7 +8,7 @@ from groq import Groq
 # Initialize FastAPI application
 app = FastAPI(title="Smart Food API")
 
-# Fetch API keys from environment variables (to be configured later in Render settings)
+# Fetch API keys from environment variables (configured in Render settings)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
@@ -23,6 +23,27 @@ if GROQ_API_KEY:
 class ChatRequest(BaseModel):
     user_message: str
     fridge_items: list[str]  # List of current items inside the fridge
+
+def find_matching_recipes(fridge_items: list[str]) -> str:
+    """
+    Helper function to read the local recipe dataset and filter it.
+    Currently, it loads the data and returns a chunk of it to be injected 
+    into the LLM context. You can later upgrade this to implement a strict 
+    matching algorithm based on the freshness points and fridge items.
+    """
+    try:
+        # Loading the dataset provided by the user
+        with open("recipes_groq_cleaned.json", "r", encoding="utf-8") as file:
+            all_recipes = json.load(file)
+            
+        # Example logic: Return the first 5 recipes to avoid token limit exceptions.
+        # Once your algorithm is ready, replace this with your filtered list.
+        suggested_recipes = all_recipes[:5] 
+        return json.dumps(suggested_recipes, ensure_ascii=False)
+    except FileNotFoundError:
+        return "No local dataset found. Proceed using general knowledge."
+    except Exception as e:
+        return f"Error reading dataset: {str(e)}"
 
 @app.get("/")
 def read_root():
@@ -70,8 +91,8 @@ async def analyze_fridge(image: UploadFile = File(...)):
         chat_completion = groq_client.chat.completions.create(
             messages=[{"role": "user", "content": groq_prompt}],
             model="llama-3.3-70b-versatile",
-            temperature=0.1, # Very low temperature to ensure strict JSON formatting and prevent hallucinations
-            response_format={"type": "json_object"} # Force the model to return a clean JSON object
+            temperature=0.1, # Very low temperature to ensure strict JSON formatting
+            response_format={"type": "json_object"} 
         )
         
         clean_json = json.loads(chat_completion.choices[0].message.content)
@@ -85,7 +106,7 @@ async def analyze_fridge(image: UploadFile = File(...)):
 async def chat_bot(request: ChatRequest):
     """
     This endpoint receives the user's message alongside the current fridge inventory,
-    and suggests Turkish recipes based on the available ingredients.
+    reads the dataset, and suggests Turkish recipes based on the available ingredients.
     """
     if not GROQ_API_KEY:
         raise HTTPException(status_code=500, detail="Groq API Key is not configured.")
@@ -93,17 +114,24 @@ async def chat_bot(request: ChatRequest):
     try:
         items_str = ", ".join(request.fridge_items)
         
+        # 1. Fetch recipes from the JSON dataset
+        dataset_recipes = find_matching_recipes(request.fridge_items)
+        
+        # 2. Construct the RAG (Retrieval-Augmented Generation) prompt
         system_prompt = f"""
         You are an expert Turkish Chef AI.
         The user currently has these items in their fridge: {items_str}.
         
-        Your tasks:
-        1. Answer their cooking-related questions.
-        2. If they ask for recipes, suggest Turkish dishes that use these exact ingredients.
-        3. Prioritize items that typically spoil fast (if mentioned).
-        4. Suggest alternatives if they are missing a specific ingredient.
+        DATABASE RECIPES TO USE:
+        {dataset_recipes}
         
-        Always answer in clear, polite Turkish.
+        Your tasks:
+        1. If the user asks for what to cook, ONLY suggest dishes from the 'DATABASE RECIPES TO USE' provided above.
+        2. Answer their cooking-related questions.
+        3. Prioritize items that typically spoil fast (if mentioned in the fridge list).
+        4. Suggest alternatives if they are missing a specific ingredient required by the database recipe.
+        
+        CRITICAL: Always answer in clear, polite Turkish. Do not use English in your response.
         """
         
         chat_completion = groq_client.chat.completions.create(
@@ -112,7 +140,7 @@ async def chat_bot(request: ChatRequest):
                 {"role": "user", "content": request.user_message}
             ],
             model="llama-3.3-70b-versatile",
-            temperature=0.7, # Slightly higher temperature to allow for creative culinary suggestions
+            temperature=0.5, # Lowered temperature to enforce adherence to the provided dataset
         )
         
         return {"status": "success", "reply": chat_completion.choices[0].message.content}
