@@ -29,9 +29,10 @@ TEXT_MODEL = "llama-3.3-70b-versatile"
 
 # Kendi çalışan model adını EN BAŞA koy
 VISION_CANDIDATES = [
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-exp",
-    "gemini-1.5-flash",
+    "models/gemini-3.6-flash",
+    "models/gemini-3.5-flash",
+    "models/gemini-2.5-flash",
+    "models/gemini-flash-latest",
 ]
 _working_vision_model: Optional[str] = None
 
