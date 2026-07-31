@@ -106,9 +106,20 @@ def normalize(text) -> str:
 
 
 def strip_think(text: str) -> str:
-    """Qwen thinking modu <think>...</think> üretebilir — temizle."""
+    """Qwen düşünce çıktısını temizle — hem etiket hem düz metin biçimi."""
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
-    return text.replace("<think>", "").replace("</think>", "").strip()
+    text = text.replace("<think>", "").replace("</think>", "")
+
+    for marker in ("thinking process:", "thought process:", "thinking:",
+                   "thought:", "reasoning:", "analysis:"):
+        low = text.lower()
+        i = low.find(marker)
+        if i != -1:
+            rest = text[i + len(marker):]
+            parts = rest.split("\n\n", 1)
+            text = text[:i] + (parts[1] if len(parts) > 1 else "")
+
+    return text.strip()
 
 
 def parse_json_loose(text: str) -> dict:
@@ -142,6 +153,9 @@ def groq_chat(role: str, models: list, messages: list, temperature: float,
                 kwargs["response_format"] = {"type": "json_object"}
             if max_tokens:
                 kwargs["max_tokens"] = max_tokens
+            if name.startswith("qwen"):                    # ← جديد
+                kwargs["reasoning_format"] = "hidden"      # ← جديد
+
 
             res = groq_client.chat.completions.create(**kwargs)
             if _working.get(role) != name:
