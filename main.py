@@ -27,7 +27,7 @@ if GROQ_API_KEY:
 
 TEXT_MODEL = "llama-3.3-70b-versatile"
 
-# Kendi çalışan model adını EN BAŞA koy
+# Çalışan model adını EN BAŞA koy. /debug/models ile listeyi görebilirsin.
 VISION_CANDIDATES = [
     "models/gemini-3.6-flash",
     "models/gemini-3.5-flash",
@@ -51,14 +51,14 @@ class ChatRequest(BaseModel):
     fridge_items: list[str] = []
     history: list[ChatMessage] = []
     context_notes: list[str] = []
-    exclude_recipe_names: list[str] = []   # YENİ: çeşitlilik için
-    diet_prefs: list[str] = []             # YENİ: laktozsuz, helal, vejetaryen...
+    exclude_recipe_names: list[str] = []
+    diet_prefs: list[str] = []
 
 
 class ProductChatRequest(BaseModel):
-    """YENİ: etiket taraması sonrası ürüne özel sohbet."""
+    """Etiket taraması sonrası, yalnızca o ürüne özel sohbet."""
     user_message: str
-    product: dict                  # /analyze-label çıktısı
+    product: dict
     diet_prefs: list[str] = []
     allergens: list[str] = []
     history: list[ChatMessage] = []
@@ -72,14 +72,14 @@ def check_auth(x_app_key: Optional[str]):
 
 
 def normalize(text: str) -> str:
-    text = text.lower()
+    text = str(text).lower()
     for a, b in [("ı", "i"), ("ş", "s"), ("ğ", "g"), ("ü", "u"), ("ö", "o"), ("ç", "c")]:
         text = text.replace(a, b)
-    return unicodedata.normalize("NFKD", text)
+    return unicodedata.normalize("NFKD", text).strip()
 
 
 def groq_call(messages: list, temperature: float, json_mode: bool = False):
-    """Groq çağrısı + rate limit'i 429 olarak yüzeye çıkarma."""
+    """Groq çağrısı. Kota hatasını 429 olarak yüzeye çıkarır."""
     try:
         kwargs = dict(messages=messages, model=TEXT_MODEL, temperature=temperature)
         if json_mode:
@@ -87,7 +87,7 @@ def groq_call(messages: list, temperature: float, json_mode: bool = False):
         return groq_client.chat.completions.create(**kwargs)
     except Exception as e:
         text = str(e)
-        if "429" in text or "rate limit" in text.lower() or "Rate limit" in text:
+        if "429" in text or "rate limit" in text.lower():
             log.warning(f"[groq] RATE LIMIT: {text[:300]}")
             raise HTTPException(
                 status_code=429,
@@ -96,28 +96,98 @@ def groq_call(messages: list, temperature: float, json_mode: bool = False):
         raise
 
 
+# ───────────────────── Tarif veri seti yardımcıları ─────────────────────
+# Veri setinin alan adları TÜRKÇE:
+#   tarif_adi, kategori, malzemeler[{isim, miktar, birim}],
+#   yapilis_adimlari[], pisirme_suresi_dk, zorluk
+
 def load_recipes() -> list:
     global _RECIPES_CACHE
     if _RECIPES_CACHE is None:
         try:
             with open("recipes_groq_cleaned.json", "r", encoding="utf-8") as f:
                 _RECIPES_CACHE = json.load(f)
-            log.info(f"[recipes] loaded {len(_RECIPES_CACHE)} recipes")
+            log.info(f"[recipes] loaded {len(_RECIPES_CACHE)}")
         except Exception as e:
             log.warning(f"[recipes] load failed: {e}")
             _RECIPES_CACHE = []
     return _RECIPES_CACHE
 
 
+def get_recipe_name(r: dict) -> str:
+    return r.get("tarif_adi") or r.get("name") or r.get("title") or ""
+
+
+def get_ingredient_names(r: dict) -> list[str]:
+    """malzemeler: [{isim, miktar, birim}] → ['kıyma', 'soğan', ...]"""
+    raw = r.get("malzemeler") or r.get("ingredients") or []
+    out = []
+    for i in raw:
+        n = i.get("isim") or i.get("name") or "" if isinstance(i, dict) else str(i)
+        n = n.strip()
+        if n:
+            out.append(n)
+    return out
+
+
+# Dolapta zaten bulunan / kullanıcının envantere eklemediği temel malzemeler.
+# Eşleştirme oranını bunlar bozmasın diye hesaptan çıkarılır.
+PANTRY_STAPLES = {
+    "tuz", "karabiber", "kimyon", "kirmizi toz biber", "kirmizi pul biber",
+    "pul biber", "toz biber", "nane", "kekik", "seker", "toz seker", "un",
+    "su", "sivi yag", "zeytinyagi", "yemeklik yag", "aycicek yagi",
+    "kabartma tozu", "vanilya", "vanilin", "sirke", "limon suyu",
+    "salca", "domates salcasi", "biber salcasi", "nisasta", "maydanoz",
+    "dereotu", "sumak", "tarcin", "karanfil", "defne yapragi", "susam",
+    "galeta unu", "irmik", "bulyon", "seker surubu", "bal",
+}
+
+
+def core_ingredients(names: list[str]) -> list[str]:
+    """Baharat ve temel malzemeleri eşleştirme dışında bırakır."""
+    core = [n for n in names if normalize(n) not in PANTRY_STAPLES]
+    return core or names
+
+
+# Diyet filtreleri — malzeme adları üzerinde tam/kelime eşleşmesi
+MEAT_WORDS = {"et", "kiyma", "tavuk", "hindi", "kuzu", "dana", "balik",
+              "sucuk", "pastirma", "salam", "sosis", "ciger", "kusbasi",
+              "but", "gogus", "kanat", "midye", "karides", "ton baligi"}
+DAIRY_WORDS = {"sut", "peynir", "yogurt", "kaymak", "krema", "tereyagi",
+               "labne", "ayran", "kasar", "lor", "cokelek"}
+ANIMAL_WORDS = MEAT_WORDS | DAIRY_WORDS | {"yumurta", "jelatin", "bal"}
+HARAM_WORDS = {"domuz", "jambon", "bacon", "alkol", "sarap", "likor",
+               "rom", "bira", "votka", "konyak"}
+
+
+def has_word(ings_norm: list[str], words: set) -> bool:
+    for ing in ings_norm:
+        tokens = set(ing.split())
+        if ing in words or tokens & words:
+            return True
+    return False
+
+
+def passes_diet(ings: list[str], prefs: set) -> bool:
+    n = [normalize(i) for i in ings]
+    if "helal" in prefs and has_word(n, HARAM_WORDS):
+        return False
+    if "vejetaryen" in prefs and has_word(n, MEAT_WORDS):
+        return False
+    if "vegan" in prefs and has_word(n, ANIMAL_WORDS):
+        return False
+    if "laktozsuz" in prefs and has_word(n, DAIRY_WORDS):
+        return False
+    return True
+
+
 def slim_recipe(r: dict) -> dict:
-    """
-    TOKEN TASARRUFU: modele sadece ad + malzeme gider.
-    Adımlar, açıklamalar, görseller GÖNDERİLMEZ.
-    """
-    ings = r.get("ingredients") or []
+    """TOKEN TASARRUFU: modele sadece ad + malzeme adları + süre gider."""
     return {
-        "name": r.get("name") or r.get("title") or "",
-        "ingredients": [str(i)[:40] for i in ings[:12]],
+        "name": get_recipe_name(r),
+        "ingredients": get_ingredient_names(r)[:12],
+        "minutes": r.get("pisirme_suresi_dk"),
+        "difficulty": r.get("zorluk"),
     }
 
 
@@ -126,47 +196,32 @@ def find_matching_recipes(
     exclude_names: list[str],
     diet_prefs: list[str],
 ) -> str:
-    """
-    Dolaba göre gerçek eşleştirme + çeşitlilik.
-    fridge_items risk sırasına göre gelir (en riskli ilk).
-    """
+    """Dolaba göre gerçek eşleştirme + çeşitlilik. fridge_items risk sıralı gelir."""
     all_recipes = load_recipes()
     if not all_recipes:
         return "[]"
 
-    excluded = {normalize(n) for n in exclude_names}
+    excluded = {normalize(x) for x in exclude_names}
     prefs = {normalize(p) for p in diet_prefs}
     fridge_norm = [normalize(i) for i in fridge_items]
 
     scored = []
     for r in all_recipes:
-        name_n = normalize(r.get("name") or r.get("title") or "")
-        if name_n in excluded:
+        if normalize(get_recipe_name(r)) in excluded:
             continue
 
-        ings = r.get("ingredients") or []
-        if not ings:
+        all_ings = get_ingredient_names(r)
+        if not all_ings:
             continue
 
-        blob = normalize(json.dumps(r, ensure_ascii=False))
+        if not passes_diet(all_ings, prefs):
+            continue
 
-        # Diyet filtreleri
-        if "helal" in prefs and any(w in blob for w in
-                                    ["domuz", "jambon", "bacon", "alkol", "sarap", "likor", "rom"]):
-            continue
-        if "vejetaryen" in prefs and any(w in blob for w in
-                                         ["et", "tavuk", "balik", "kiyma", "sucuk", "pastirma"]):
-            continue
-        if "vegan" in prefs and any(w in blob for w in
-                                    ["et", "tavuk", "balik", "kiyma", "sut", "peynir", "yumurta", "yogurt", "tereyagi"]):
-            continue
-        if "laktozsuz" in prefs and any(w in blob for w in
-                                        ["sut", "peynir", "yogurt", "kaymak", "krema", "tereyagi"]):
-            continue
+        ings = core_ingredients(all_ings)
 
         matches, urgent = 0, 0
         for ing in ings:
-            ing_n = normalize(str(ing))
+            ing_n = normalize(ing)
             words = [w for w in ing_n.split() if len(w) > 3]
             for idx, item in enumerate(fridge_norm):
                 if ing_n in item or any(w in item for w in words):
@@ -181,16 +236,18 @@ def find_matching_recipes(
 
     if not scored:
         pool = [r for r in all_recipes
-                if normalize(r.get("name") or r.get("title") or "") not in excluded]
+                if normalize(get_recipe_name(r)) not in excluded
+                and passes_diet(get_ingredient_names(r), prefs)]
         picks = random.sample(pool, min(5, len(pool))) if pool else []
+        log.info(f"[recipes] no match, random {len(picks)}")
         return json.dumps([slim_recipe(r) for r in picks], ensure_ascii=False)
 
-    # ÇEŞİTLİLİK: aynı puandakileri karıştır, sonra sırala
+    # ÇEŞİTLİLİK: eşit puanlıları karıştır, sonra sırala
     random.shuffle(scored)
     scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
     top = [slim_recipe(r) for _, _, r in scored[:6]]
-    log.info(f"[recipes] matched {len(scored)}, sending {len(top)} slim")
+    log.info(f"[recipes] matched {len(scored)}, sending {len(top)}")
     return json.dumps(top, ensure_ascii=False)
 
 
@@ -238,6 +295,30 @@ def debug_models():
         raise HTTPException(500, f"{type(e).__name__}: {e}")
 
 
+@app.get("/debug/recipe")
+def debug_recipe():
+    r = load_recipes()
+    if not r:
+        return {"count": 0, "sample": None}
+    s = r[0]
+    return {
+        "count": len(r),
+        "keys": list(s.keys()),
+        "parsed_name": get_recipe_name(s),
+        "parsed_ingredients": get_ingredient_names(s),
+        "core_ingredients": core_ingredients(get_ingredient_names(s)),
+        "slim": slim_recipe(s),
+    }
+
+
+@app.get("/debug/match")
+def debug_match(items: str = "domates,sogan,yumurta"):
+    """Eşleştirmeyi tarayıcıdan test et: /debug/match?items=domates,kiyma"""
+    fridge = [i.strip() for i in items.split(",") if i.strip()]
+    result = find_matching_recipes(fridge, [], [])
+    return {"fridge": fridge, "matches": json.loads(result)}
+
+
 @app.post("/analyze-fridge")
 async def analyze_fridge(
     images: list[UploadFile] = File(...),
@@ -264,11 +345,11 @@ async def analyze_fridge(
         prompt = f"""Clean this fridge item list.
 1. Remove duplicates.
 2. Turkish names WITH proper characters (Süt not Sut).
-3. Category: exactly one of Sebze, Meyve, Süt Ürünleri, Protein, Tahıl, İçecek, Baharat, Donuk, Diğer
-4. freshness_points 0-100 = how fresh it LOOKS only. Cannot judge → 85.
-5. quantity + unit (adet, paket, kap, gram, ml, kg, litre).
+3. category: exactly one of Sebze, Meyve, Süt Ürünleri, Protein, Tahıl, İçecek, Baharat, Donuk, Diğer
+4. freshness_points 0-100 = how fresh the item LOOKS only. Cannot judge → 85.
+5. quantity (number) + unit (adet, paket, kap, gram, ml, kg, litre).
 
-Return ONLY JSON:
+Return ONLY JSON, no markdown:
 {{"items":[{{"name":"Domates","category":"Sebze","freshness_points":80,"quantity":5,"unit":"adet"}}]}}
 
 Text: {raw[:3000]}"""
@@ -313,24 +394,38 @@ async def analyze_label(
         prompt = f"""Parse this food label OCR text.
 
 1. product_name: Turkish, proper characters. Unreadable → null.
-2. ingredients: array (Turkish).
-3. allergens: ONLY these keys — sut, yumurta, gluten, findik, fistik, soya, susam,
+2. ingredients: ARRAY of strings (Turkish). None found → [].
+3. allergens: ARRAY of strings — ONLY the allergens actually present.
+   Allowed keys: sut, yumurta, gluten, findik, fistik, soya, susam,
    balik, kabuklu_deniz, hardal, kereviz
+   With milk and hazelnut: "allergens": ["sut", "findik"]
+   With none: "allergens": []
+   NEVER return an object with true/false values. ALWAYS an array of strings.
 4. contains_lactose, contains_pork, contains_alcohol: booleans.
    pork = domuz, jambon, bacon, lard, unknown-origin gelatin.
-5. category: Sebze, Meyve, Süt Ürünleri, Protein, Tahıl, İçecek, Baharat, Donuk, Diğer
+5. category: exactly one of Sebze, Meyve, Süt Ürünleri, Protein, Tahıl, İçecek, Baharat, Donuk, Diğer
 6. expiry_date: ISO "YYYY-MM-DD" or null.
-7. storage: Buzdolabı, Dondurucu, Oda Sıcaklığı, Kiler. Default Buzdolabı.
-8. confidence 0-100.
-9. summary: 1 short Turkish sentence describing the product.
-10. raw_text: original OCR, max 1500 chars.
+7. storage: Buzdolabı, Dondurucu, Oda Sıcaklığı or Kiler. Default Buzdolabı.
+8. confidence: 0-100, how readable the label was.
+9. summary: ONE short Turkish sentence describing the product.
+10. raw_text: original OCR text, max 1500 chars.
 
-Return ONLY JSON.
+Return ONLY JSON, no markdown.
 
 OCR: {ocr[:4000]}"""
 
         completion = groq_call([{"role": "user", "content": prompt}], 0.1, json_mode=True)
-        return {"status": "success", "data": json.loads(completion.choices[0].message.content)}
+        data = json.loads(completion.choices[0].message.content)
+
+        # Güvenlik ağı: model yine de obje döndürürse diziye çevir
+        al = data.get("allergens")
+        if isinstance(al, dict):
+            data["allergens"] = [k for k, v in al.items() if v is True]
+            log.warning("[analyze-label] allergens was object, converted to array")
+        elif not isinstance(al, list):
+            data["allergens"] = []
+
+        return {"status": "success", "data": data}
 
     except HTTPException:
         raise
@@ -344,10 +439,7 @@ async def product_chat(
     request: ProductChatRequest,
     x_app_key: Optional[str] = Header(None),
 ):
-    """
-    YENİ — Etiket taraması sonrası, YALNIZCA o ürün hakkında sohbet.
-    Dolap sohbetinden tamamen ayrıdır; tarif önermez, dolaba ekleme önermez.
-    """
+    """Etiket taraması sonrası, YALNIZCA o ürün hakkında sohbet."""
     check_auth(x_app_key)
 
     if not GROQ_API_KEY:
@@ -379,7 +471,7 @@ USER PROFILE:
 - Allergens: {', '.join(request.allergens) or 'yok'}
 
 Rules:
-1. Answer ONLY about this product: its ingredients, whether it matches the user's
+1. Answer ONLY about this product: ingredients, whether it matches the user's
    diet and allergens, how to store it, what it contains.
 2. Do NOT suggest recipes. Do NOT talk about the fridge. Do NOT offer to add it anywhere.
 3. If asked whether it suits them, compare against the profile and answer clearly:
@@ -389,14 +481,14 @@ Rules:
 5. If the label was unreadable (null name, empty ingredients), say so honestly and
    suggest rescanning with better lighting.
 6. Out of scope → "Ben taradığınız ürün hakkında yardımcı olabilirim."
-7. Short answers: 2-4 sentences. Phone screen.
+7. Short answers: 2-4 sentences. This is a phone screen.
 
 Always answer in Turkish."""
 
         messages = [{"role": "system", "content": system}]
         for m in request.history[-6:]:
             if m.role in ("user", "assistant"):
-                messages.append({"role": m.role, "content": m.content})
+                messages.append({"role": m.role, "content": m.content[:600]})
         messages.append({"role": "user", "content": request.user_message})
 
         completion = groq_call(messages, 0.3)
@@ -440,23 +532,25 @@ FRIDGE (most urgent first):
 
 DIET: {', '.join(request.diet_prefs) or 'yok'}
 {ctx}
-AVAILABLE RECIPES (name + ingredients only):
+AVAILABLE RECIPES (name, ingredients, minutes, difficulty):
 {recipes}
 
 Rules:
 1. Suggest ONLY from AVAILABLE RECIPES. Never invent a recipe.
-2. Never mention internal labels like "AVAILABLE RECIPES" or "MATCHED".
+2. Never mention internal labels like "AVAILABLE RECIPES".
 3. Prioritise items marked ACİL and say WHY you picked that dish.
 4. Suggest ONE dish at a time unless asked for more. Do not list everything.
-5. If the user asks for something different, vegetarian, oil-free, quicker, etc.
-   — pick a DIFFERENT dish from the list that fits. Never repeat the previous one.
+5. If the user asks for something different, vegetarian, oil-free, quicker etc.,
+   pick a DIFFERENT dish from the list that fits. Never repeat the previous one.
 6. Suggest substitutions for missing ingredients.
-7. Scope: fridge, recipes, cooking, substitutions. Otherwise:
+7. Salt, pepper, oil, flour and common spices are assumed to be at home —
+   do not treat them as missing.
+8. Scope: fridge, recipes, cooking, substitutions. Otherwise reply:
    "Ben Gıda Asistanınızım. Dolabınızdaki malzemeler ve tarifler konusunda
    yardımcı olabilirim."
-8. Never medical or nutrition advice. Facts only.
-9. If diet includes HELAL, never suggest pork or alcohol.
-10. Short: 3-5 sentences.
+9. Never medical or nutrition advice. Facts only.
+10. If diet includes HELAL, never suggest pork or alcohol.
+11. Short: 3-5 sentences.
 
 Always answer in Turkish."""
 
@@ -474,10 +568,3 @@ Always answer in Turkish."""
     except Exception as e:
         log.error("[chat] FAILED\n" + traceback.format_exc())
         raise HTTPException(500, f"{type(e).__name__}: {e}")
-
-# test
-@app.get("/debug/recipe")
-def debug_recipe():
-    r = load_recipes()
-    return {"count": len(r), "sample": r[0] if r else None,
-            "keys": list(r[0].keys()) if r else []}
