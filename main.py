@@ -1,13 +1,16 @@
 """
 Smart Food API
 
-Model dağılımı — SADECE İKİ MODEL:
-  Qwen 3.6 27B (Groq)   → etiket OCR, ürün sohbeti, tarif sohbeti, niyet
-  Gemini 3.6 Flash      → buzdolabı görüntü tanıma
+Model dağılımı — her modelin Groq'ta AYRI TPM kotası var, iş bölümü
+günlük kotayı üçe böler:
+
+  Qwen 3.6 27B (Groq)    → SADECE etiket OCR (düz metin, JSON yok)
+  Llama 3.3 70B (Groq)   → tüm sohbetler, etiket yapılandırma, niyet çıkarımı
+  Gemini 3.6 Flash       → SADECE buzdolabı görüntü tanıma
 
 İki ayrı akış, hiçbir noktada karışmazlar:
-  A) ETİKET:  /analyze-label (Qwen OCR) → /product-chat (Qwen)
-  B) DOLAP:   /analyze-fridge (Gemini)  → /chat (Qwen)
+  A) ETİKET:  /analyze-label (Qwen OCR → Llama JSON) → /product-chat (Llama)
+  B) DOLAP:   /analyze-fridge (Gemini)               → /chat (Llama)
 """
 
 import os
@@ -40,12 +43,15 @@ groq_client = Groq(api_key=GROQ_API_KEY, max_retries=0) if GROQ_API_KEY else Non
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-QWEN = "qwen/qwen3.6-27b"              # OCR + tüm sohbetler + niyet
-GEMINI_VISION = "models/gemini-3.6-flash"   # sadece buzdolabı
+QWEN_OCR = "qwen/qwen3.6-27b"                # sadece OCR
+LLAMA_CHAT = "llama-3.3-70b-versatile"       # tüm sohbet + JSON işleri
+GEMINI_VISION = "models/gemini-3.6-flash"    # sadece dolap
+
+# Groq TPM limiti 8000 → Qwen'e aynı anda en fazla 2 görsel gönderilebilir
+MAX_LABEL_IMAGES = 2
+MAX_FRIDGE_IMAGES = 4
 
 _RECIPES_CACHE = None
-MAX_LABEL_IMAGES = 2      # Qwen 3 destekliyor ama TPM 8000 limiti 2'ye zorluyor
-MAX_FRIDGE_IMAGES = 4     # Gemini — limit yok
 
 
 # ── Şemalar ─────────────────────────────────────────────────────────────
@@ -87,7 +93,7 @@ def normalize(text) -> str:
 
 
 def strip_think(text: str) -> str:
-    """Qwen düşünce çıktısını temizle — hem etiketli hem düz metin biçimi."""
+    """Qwen düşünce çıktısını temizle."""
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = text.replace("<think>", "").replace("</think>", "")
     for marker in ("thinking process:", "thought process:", "thinking:",
@@ -113,14 +119,15 @@ def parse_json_loose(text: str) -> dict:
         raise
 
 
-def qwen(messages: list, temperature: float = 0.3,
-         json_mode: bool = False, max_tokens: Optional[int] = None) -> str:
-    """Tüm Groq/Qwen çağrıları buradan geçer."""
+def _groq(model: str, messages: list, temperature: float,
+          json_mode: bool = False, max_tokens: Optional[int] = None,
+          hide_reasoning: bool = False) -> str:
     if not groq_client:
         raise HTTPException(500, "GROQ_API_KEY is not configured.")
     try:
-        kwargs = dict(model=QWEN, messages=messages, temperature=temperature,
-                      reasoning_format="hidden")
+        kwargs = dict(model=model, messages=messages, temperature=temperature)
+        if hide_reasoning:
+            kwargs["reasoning_format"] = "hidden"
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
         if max_tokens:
@@ -129,12 +136,27 @@ def qwen(messages: list, temperature: float = 0.3,
         return res.choices[0].message.content or ""
     except Exception as e:
         msg = str(e)
+        # 413 = tek istek TPM limitini aştı, 429 = kota doldu → ikisi de kullanıcıya aynı
         if "429" in msg or "413" in msg or "rate limit" in msg.lower():
-            log.warning(f"[qwen] RATE LIMIT: {msg[:200]}")
+            log.warning(f"[{model}] RATE LIMIT: {msg[:200]}")
             raise HTTPException(
-                429, "Günlük yapay zeka kotası doldu. Lütfen daha sonra tekrar deneyin.")
-        log.error(f"[qwen] {type(e).__name__}: {msg[:400]}")
+                429,
+                "Yapay zeka kotası doldu. Lütfen bir dakika sonra tekrar deneyin.")
+        log.error(f"[{model}] {type(e).__name__}: {msg[:400]}")
         raise
+
+
+def qwen_ocr(messages: list, max_tokens: int = 2000) -> str:
+    """Qwen — sadece OCR. Düz metin çıktı, json_mode YOK."""
+    return strip_think(_groq(QWEN_OCR, messages, 0.0,
+                             max_tokens=max_tokens, hide_reasoning=True))
+
+
+def llama(messages: list, temperature: float = 0.3,
+          json_mode: bool = False, max_tokens: Optional[int] = None) -> str:
+    """Llama — tüm sohbetler, JSON yapılandırma, niyet çıkarımı."""
+    return _groq(LLAMA_CHAT, messages, temperature,
+                 json_mode=json_mode, max_tokens=max_tokens)
 
 
 async def read_image(img: UploadFile) -> tuple:
@@ -146,7 +168,6 @@ async def read_image(img: UploadFile) -> tuple:
 
 
 def qwen_vision_message(prompt: str, images: list) -> list:
-    """images: [(bytes, mime), ...]"""
     content = [{"type": "text", "text": prompt}]
     for data, mime in images:
         b64 = base64.b64encode(data).decode()
@@ -156,7 +177,7 @@ def qwen_vision_message(prompt: str, images: list) -> list:
 
 
 def gemini_vision(prompt: str, images: list) -> str:
-    """Sadece buzdolabı görüntü tanıma. images: [(bytes, mime), ...]"""
+    """Sadece buzdolabı görüntü tanıma."""
     if not GEMINI_API_KEY:
         raise HTTPException(500, "GEMINI_API_KEY is not configured.")
     parts = [prompt]
@@ -167,7 +188,7 @@ def gemini_vision(prompt: str, images: list) -> str:
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  A) ETİKET AKIŞI — Qwen
+#  A) ETİKET AKIŞI — Qwen OCR + Llama yapılandırma/sohbet
 # ════════════════════════════════════════════════════════════════════════
 
 OCR_PROMPT = """
@@ -224,17 +245,14 @@ async def analyze_label(
     images: list[UploadFile] = File(...),
     x_app_key: Optional[str] = Header(None),
 ):
-    """ETİKET — Qwen OCR (düz metin) → Qwen yapılandırma (JSON)."""
+    """ETİKET — Qwen OCR (düz metin) → Llama yapılandırma (JSON)."""
     check_auth(x_app_key)
     log.info(f"[LABEL] {len(images)} image(s)")
 
     try:
         imgs = [await read_image(i) for i in images[:MAX_LABEL_IMAGES]]
 
-        raw_text = strip_think(
-            qwen(qwen_vision_message(OCR_PROMPT, imgs),
-                 temperature=0.0, max_tokens=2000)
-        )
+        raw_text = qwen_ocr(qwen_vision_message(OCR_PROMPT, imgs), max_tokens=2000)
         log.info(f"[LABEL] OCR {len(raw_text)} chars")
 
         if not raw_text.strip():
@@ -247,9 +265,9 @@ async def analyze_label(
             }}
 
         data = parse_json_loose(
-            qwen([{"role": "user",
-                   "content": LABEL_STRUCTURE_PROMPT + raw_text[:6000]}],
-                 temperature=0.1, json_mode=True)
+            llama([{"role": "user",
+                    "content": LABEL_STRUCTURE_PROMPT + raw_text[:5000]}],
+                  temperature=0.1, json_mode=True)
         )
 
         al = data.get("allergens")
@@ -258,7 +276,7 @@ async def analyze_label(
         elif not isinstance(al, list):
             data["allergens"] = []
 
-        data["raw_text"] = raw_text[:5000]
+        data["raw_text"] = raw_text[:6000]
         log.info(f"[LABEL] name={data.get('product_name')} conf={data.get('confidence')}")
         return {"status": "success", "data": data}
 
@@ -274,7 +292,7 @@ async def product_chat(
     request: ProductChatRequest,
     x_app_key: Optional[str] = Header(None),
 ):
-    """ÜRÜN SOHBETİ — Qwen, kendi OCR çıktısını yorumlar. Sadece bu ürün."""
+    """ÜRÜN SOHBETİ — Llama. Sadece taranan ürün hakkında."""
     check_auth(x_app_key)
 
     try:
@@ -291,11 +309,11 @@ async def product_chat(
             "nutrition": p.get("nutrition") or {},
         }, ensure_ascii=False)
 
-        raw = (request.raw_text or p.get("raw_text") or "")[:5000]
+        raw = (request.raw_text or p.get("raw_text") or "")[:4000]
 
         system = f"""Your name is "Gıda Asistanı".
 
-You read this product's packaging yourself. Discuss ONLY this product.
+The user scanned this product's packaging. Discuss ONLY this product.
 
 STRUCTURED DATA:
 {summary}
@@ -321,7 +339,7 @@ Rules:
 5. Facts only. No medical or nutrition advice.
 6. If the label was unreadable, say so and suggest rescanning closer.
 7. Out of scope → "Ben taradığınız ürün hakkında yardımcı olabilirim."
-8. Short: 2-4 sentences. No <think> tags.
+8. Short: 2-4 sentences.
 
 Always answer in Turkish."""
 
@@ -331,7 +349,7 @@ Always answer in Turkish."""
                 messages.append({"role": m.role, "content": m.content[:600]})
         messages.append({"role": "user", "content": request.user_message})
 
-        return {"status": "success", "reply": strip_think(qwen(messages, 0.3))}
+        return {"status": "success", "reply": llama(messages, 0.3)}
 
     except HTTPException:
         raise
@@ -341,7 +359,7 @@ Always answer in Turkish."""
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  B) DOLAP AKIŞI — Gemini görüntü + Qwen sohbet
+#  B) DOLAP AKIŞI — Gemini görüntü + Llama sohbet
 # ════════════════════════════════════════════════════════════════════════
 
 FRIDGE_PROMPT = """You are looking INSIDE a refrigerator or at grocery items.
@@ -467,11 +485,11 @@ def passes_diet(ings: list, prefs: set) -> bool:
 
 def slim(r: dict) -> dict:
     return {"name": r_name(r), "category": r_category(r),
-            "ingredients": r_ingredients(r)[:12],
+            "ingredients": r_ingredients(r)[:10],
             "minutes": r.get("pisirme_suresi_dk"), "difficulty": r.get("zorluk")}
 
 
-# ── Niyet çıkarımı — Qwen ───────────────────────────────────────────────
+# ── Niyet çıkarımı — Llama ──────────────────────────────────────────────
 
 INTENT_PROMPT = """Extract the user's cooking intent from their message.
 Use the recent conversation for context.
@@ -507,8 +525,11 @@ def empty_intent() -> dict:
 
 def extract_intent(user_message: str, history: list) -> dict:
     try:
-        ctx = "\n".join(f"{m.role}: {m.content[:200]}" for m in history[-4:])
-        
+        ctx = "\n".join(f"{m.role}: {m.content[:150]}" for m in history[-4:])
+        out = llama([{"role": "user",
+                      "content": f"{INTENT_PROMPT}\n\nConversation:\n{ctx}\n\n"
+                                 f"User message: {user_message}"}],
+                    temperature=0.0, json_mode=True, max_tokens=300)
         intent = parse_json_loose(out)
         log.info(f"[intent] {json.dumps(intent, ensure_ascii=False)}")
         return {**empty_intent(), **intent}
@@ -579,7 +600,7 @@ def find_recipes(fridge_items: list, exclude_names: list,
                 and normalize(r_category(r)) not in excl_cats
                 and (not want_cats or normalize(r_category(r)) in want_cats)
                 and passes_diet(r_ingredients(r), prefs)]
-        picks = random.sample(pool, min(8, len(pool))) if pool else []
+        picks = random.sample(pool, min(6, len(pool))) if pool else []
         log.info(f"[recipes] no match → {len(picks)} random from filtered pool")
         return json.dumps([slim(r) for r in picks], ensure_ascii=False)
 
@@ -589,7 +610,7 @@ def find_recipes(fridge_items: list, exclude_names: list,
     seen, top = {}, []
     for _, _, r in scored:
         c = normalize(r_category(r))
-        if seen.get(c, 0) >= 3:
+        if seen.get(c, 0) >= 2:
             continue
         seen[c] = seen.get(c, 0) + 1
         top.append(slim(r))
@@ -605,14 +626,14 @@ async def chat(
     request: ChatRequest,
     x_app_key: Optional[str] = Header(None),
 ):
-    """DOLAP SOHBETİ — Qwen. Tarif önerisi."""
+    """DOLAP SOHBETİ — Llama. Tarif önerisi."""
     check_auth(x_app_key)
 
     try:
         intent = extract_intent(request.user_message, request.history)
         recipes = find_recipes(request.fridge_items, request.exclude_recipe_names,
                                request.diet_prefs, intent)
-        items = "\n".join(f"- {i}" for i in request.fridge_items[:25]) or "(dolap boş)"
+        items = "\n".join(f"- {i}" for i in request.fridge_items[:20]) or "(dolap boş)"
 
         cons = []
         if intent.get("exclude_categories"):
@@ -656,17 +677,17 @@ Rules:
    "Ben Gıda Asistanınızım. Dolabınızdaki malzemeler ve tarifler konusunda
    yardımcı olabilirim."
 10. Facts only, no medical or nutrition advice.
-11. Short: 3-5 sentences. No <think> tags.
+11. Short: 3-5 sentences.
 
 Always answer in Turkish."""
 
         messages = [{"role": "system", "content": system}]
         for m in request.history[-6:]:
             if m.role in ("user", "assistant"):
-                messages.append({"role": m.role, "content": m.content[:600]})
+                messages.append({"role": m.role, "content": m.content[:500]})
         messages.append({"role": "user", "content": request.user_message})
 
-        return {"status": "success", "reply": strip_think(qwen(messages, 0.6))}
+        return {"status": "success", "reply": llama(messages, 0.6)}
 
     except HTTPException:
         raise
@@ -683,7 +704,10 @@ Always answer in Turkish."""
 def root():
     return {"status": "success", "message": "Smart Food Backend is running!",
             "recipes_loaded": len(load_recipes()),
-            "models": {"qwen": QWEN, "gemini_fridge": GEMINI_VISION}}
+            "models": {"ocr": QWEN_OCR, "chat": LLAMA_CHAT,
+                       "fridge_vision": GEMINI_VISION},
+            "limits": {"label_images": MAX_LABEL_IMAGES,
+                       "fridge_images": MAX_FRIDGE_IMAGES}}
 
 
 @app.get("/debug/models")
