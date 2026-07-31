@@ -254,7 +254,7 @@ async def analyze_label(
 
         try:
             raw_text = qwen_ocr(qwen_vision_message(OCR_PROMPT, imgs), max_tokens=2500)
-            log.info(f"[LABEL] Qwen OCR {len(raw_text)} chars")
+            log.info(f"[LABEL] Qwen OCR {len(raw_text)} chars:\n{raw_text[:2000]}")
         except HTTPException as e:
             if e.status_code == 429 and GEMINI_API_KEY:
                 log.warning("[LABEL] Qwen limit asildi → Gemini yedegi")
@@ -766,3 +766,20 @@ def debug_match(items: str = "domates,sogan", q: str = ""):
     intent = extract_intent(q, []) if q else empty_intent()
     return {"fridge": fridge, "intent": intent,
             "matches": json.loads(find_recipes(fridge, [], [], intent))}
+
+#test
+@app.post("/debug/ocr")
+async def debug_ocr(images: list[UploadFile] = File(...)):
+    """Sadece OCR — yapılandırma yok. Qwen'in gerçekte ne okuduğunu gösterir."""
+    imgs = [await read_image(i) for i in images[:2]]
+    sizes = [len(d) for d, _ in imgs]
+    try:
+        text = qwen_ocr(qwen_vision_message(OCR_PROMPT, imgs), max_tokens=2500)
+        return {"model": "qwen", "image_bytes": sizes,
+                "chars": len(text), "text": text}
+    except HTTPException as e:
+        if GEMINI_API_KEY:
+            text = gemini_vision(OCR_PROMPT, imgs)
+            return {"model": "gemini_fallback", "qwen_error": e.detail,
+                    "image_bytes": sizes, "chars": len(text), "text": text}
+        raise
