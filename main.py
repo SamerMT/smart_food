@@ -552,14 +552,17 @@ Return ONLY JSON:
   "wants_different": false
 }
 
-Recipe categories in the database are Turkish and lowercase, e.g.:
-  "ana yemek", "çorba", "salata", "tatlı", "kahvaltı", "börek", "makarna",
-  "pilav", "içecek", "meze", "kurabiye", "kek", "hamur işi"
+The database has EXACTLY these 8 categories. Use ONLY these strings,
+never invent others:
+  "ana yemek", "tatlı", "salata", "çorba", "kahvaltı",
+  "atıştırmalık", "içecek", "turşu"
 
 Guidance:
-- "tatlı istemiyorum", "şekerli olmasın" → exclude_categories: ["tatlı","kek","kurabiye"]
-- "yemek istiyorum", "akşam yemeği" → want_categories: ["ana yemek"],
-  exclude_categories: ["tatlı","kek","kurabiye","içecek"]
+- "tatlı istemiyorum", "şekerli olmasın" → exclude_categories: ["tatlı"]
+- "yemek istiyorum", "akşam yemeği", "öğle yemeği" → want_categories: ["ana yemek"]
+- "çorba istiyorum" → want_categories: ["çorba"]
+- "hafif bir şey", "salata" → want_categories: ["salata"]
+- "kahvaltılık" → want_categories: ["kahvaltı"]
 - "domatesli bir şey" → must_ingredients: ["domates"]
 - "etsiz olsun" → exclude_ingredients: ["et","kıyma","tavuk"]
 - "hızlı olsun" → max_minutes: 30 ; "15 dakikada" → max_minutes: 15
