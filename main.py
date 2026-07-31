@@ -1,20 +1,13 @@
 """
 Smart Food API
 
-İKİ TAMAMEN AYRI AKIŞ — hiçbir noktada karışmazlar:
+Model dağılımı — SADECE İKİ MODEL:
+  Qwen 3.6 27B (Groq)   → etiket OCR, ürün sohbeti, tarif sohbeti, niyet
+  Gemini 3.6 Flash      → buzdolabı görüntü tanıma
 
-  A) ÜRÜN ETİKETİ AKIŞI (içindekiler okuma)
-     /analyze-label   → Qwen 3.6 27B, saf OCR (layout korunur)
-     /product-chat    → Qwen 3.6 27B, kendi OCR çıktısını kullanarak
-                        SADECE o ürün hakkında sohbet (kalori, içindekiler,
-                        "bana uygun mu")
-
-  B) BUZDOLABI AKIŞI (envanter)
-     /analyze-fridge  → Qwen 3.6 27B, görseldeki ürünleri sayar
-     /chat            → niyet çıkarımı → yerel filtre → tarif önerisi
-
-Tümü Groq üzerinden. Gemini kullanılmıyor.
-NOT: llama-3.3-70b-versatile Groq'ta kullanımdan kaldırılıyor; yedek listede.
+İki ayrı akış, hiçbir noktada karışmazlar:
+  A) ETİKET:  /analyze-label (Qwen OCR) → /product-chat (Qwen)
+  B) DOLAP:   /analyze-fridge (Gemini)  → /chat (Qwen)
 """
 
 import os
@@ -30,6 +23,7 @@ from typing import Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException, Header
 from pydantic import BaseModel
 from groq import Groq
+import google.generativeai as genai
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("smart-food")
@@ -37,32 +31,19 @@ log = logging.getLogger("smart-food")
 app = FastAPI(title="Smart Food API")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 APP_SECRET = os.getenv("APP_SECRET")
 
-groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+# max_retries=0 → Groq'un kendi 40sn beklemesini kapat, 429'u biz yönetelim
+groq_client = Groq(api_key=GROQ_API_KEY, max_retries=0) if GROQ_API_KEY else None
 
-# ── Modeller ────────────────────────────────────────────────────────────
-VISION_MODELS = [
-    "qwen/qwen3.6-27b",
-    "qwen/qwen3.5-27b",
-]
-PRODUCT_CHAT_MODELS = [       # OCR'ı yapan modelin aynısı
-    "qwen/qwen3.6-27b",
-    "openai/gpt-oss-120b",
-]
-RECIPE_CHAT_MODELS = [
-    "openai/gpt-oss-120b",
-    "qwen/qwen3.6-27b",
-    "llama-3.3-70b-versatile",
-]
-INTENT_MODELS = [             # küçük ve ucuz
-    "openai/gpt-oss-20b",
-    "openai/gpt-oss-120b",
-]
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
-_working: dict = {}
+QWEN = "qwen/qwen3.6-27b"              # OCR + tüm sohbetler + niyet
+GEMINI_VISION = "models/gemini-3.6-flash"   # sadece buzdolabı
+
 _RECIPES_CACHE = None
-
 MAX_LABEL_IMAGES = 5
 MAX_FRIDGE_IMAGES = 4
 
@@ -85,13 +66,13 @@ class ChatRequest(BaseModel):
 class ProductChatRequest(BaseModel):
     user_message: str
     product: dict = {}
-    raw_text: str = ""          # OCR ham metni — kalori/besin tablosu burada
+    raw_text: str = ""
     diet_prefs: list[str] = []
     allergens: list[str] = []
     history: list[ChatMessage] = []
 
 
-# ── Ortak yardımcılar ───────────────────────────────────────────────────
+# ── Yardımcılar ─────────────────────────────────────────────────────────
 
 def check_auth(x_app_key: Optional[str]):
     if APP_SECRET and x_app_key != APP_SECRET:
@@ -106,24 +87,20 @@ def normalize(text) -> str:
 
 
 def strip_think(text: str) -> str:
-    """Qwen düşünce çıktısını temizle — hem etiket hem düz metin biçimi."""
+    """Qwen düşünce çıktısını temizle — hem etiketli hem düz metin biçimi."""
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = text.replace("<think>", "").replace("</think>", "")
-
     for marker in ("thinking process:", "thought process:", "thinking:",
                    "thought:", "reasoning:", "analysis:"):
-        low = text.lower()
-        i = low.find(marker)
+        i = text.lower().find(marker)
         if i != -1:
             rest = text[i + len(marker):]
             parts = rest.split("\n\n", 1)
             text = text[:i] + (parts[1] if len(parts) > 1 else "")
-
     return text.strip()
 
 
 def parse_json_loose(text: str) -> dict:
-    """Markdown çiti veya ön/son metinle gelen JSON'u kurtarır."""
     t = strip_think(text).strip()
     t = re.sub(r"^```(?:json)?", "", t).strip()
     t = re.sub(r"```$", "", t).strip()
@@ -136,68 +113,63 @@ def parse_json_loose(text: str) -> dict:
         raise
 
 
-def groq_chat(role: str, models: list, messages: list, temperature: float,
-              json_mode: bool = False, max_tokens: Optional[int] = None) -> str:
-    """Model listesini sırayla dener, çalışanı hatırlar. 429'u yüzeye çıkarır."""
+def qwen(messages: list, temperature: float = 0.3,
+         json_mode: bool = False, max_tokens: Optional[int] = None) -> str:
+    """Tüm Groq/Qwen çağrıları buradan geçer."""
     if not groq_client:
         raise HTTPException(500, "GROQ_API_KEY is not configured.")
-
-    order = ([_working[role]] if role in _working else []) + \
-            [m for m in models if m != _working.get(role)]
-
-    last = None
-    for name in order:
-        try:
-            kwargs = dict(model=name, messages=messages, temperature=temperature)
-            if json_mode:
-                kwargs["response_format"] = {"type": "json_object"}
-            if max_tokens:
-                kwargs["max_tokens"] = max_tokens
-            if name.startswith("qwen"):                    # ← جديد
-                kwargs["reasoning_format"] = "hidden"      # ← جديد
-
-
-            res = groq_client.chat.completions.create(**kwargs)
-            if _working.get(role) != name:
-                log.info(f"[{role}] using model: {name}")
-                _working[role] = name
-            return res.choices[0].message.content or ""
-
-        except Exception as e:
-            msg = str(e)
-            if "429" in msg or "rate limit" in msg.lower():
-                log.warning(f"[{role}] RATE LIMIT on {name}")
-                raise HTTPException(
-                    429,
-                    "Günlük yapay zeka kotası doldu. Lütfen daha sonra tekrar deneyin.",
-                )
-            last = e
-            log.warning(f"[{role}] FAILED {name}: {type(e).__name__}: {msg[:200]}")
-
-    raise RuntimeError(f"No working model for '{role}'. Last: {last}")
+    try:
+        kwargs = dict(model=QWEN, messages=messages, temperature=temperature,
+                      reasoning_format="hidden")
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        if max_tokens:
+            kwargs["max_tokens"] = max_tokens
+        res = groq_client.chat.completions.create(**kwargs)
+        return res.choices[0].message.content or ""
+    except Exception as e:
+        msg = str(e)
+        if "429" in msg or "rate limit" in msg.lower():
+            log.warning(f"[qwen] RATE LIMIT: {msg[:200]}")
+            raise HTTPException(
+                429, "Günlük yapay zeka kotası doldu. Lütfen daha sonra tekrar deneyin.")
+        log.error(f"[qwen] {type(e).__name__}: {msg[:400]}")
+        raise
 
 
-async def to_data_uri(img: UploadFile) -> str:
+async def read_image(img: UploadFile) -> tuple:
     data = await img.read()
     log.info(f"  image {img.filename} {img.content_type} {len(data)} bytes")
-    if len(data) == 0:
+    if not data:
         raise ValueError(f"Empty image: {img.filename}")
-    mime = img.content_type or "image/jpeg"
-    return f"data:{mime};base64,{base64.b64encode(data).decode()}"
+    return data, (img.content_type or "image/jpeg")
 
 
-def vision_message(prompt: str, data_uris: list) -> list:
+def qwen_vision_message(prompt: str, images: list) -> list:
+    """images: [(bytes, mime), ...]"""
     content = [{"type": "text", "text": prompt}]
-    for uri in data_uris:
-        content.append({"type": "image_url", "image_url": {"url": uri}})
+    for data, mime in images:
+        b64 = base64.b64encode(data).decode()
+        content.append({"type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{b64}"}})
     return [{"role": "user", "content": content}]
 
 
+def gemini_vision(prompt: str, images: list) -> str:
+    """Sadece buzdolabı görüntü tanıma. images: [(bytes, mime), ...]"""
+    if not GEMINI_API_KEY:
+        raise HTTPException(500, "GEMINI_API_KEY is not configured.")
+    parts = [prompt]
+    for data, mime in images:
+        parts.append({"mime_type": mime, "data": data})
+    res = genai.GenerativeModel(GEMINI_VISION).generate_content(parts)
+    return res.text or ""
+
+
 # ════════════════════════════════════════════════════════════════════════
-#  A) ÜRÜN ETİKETİ AKIŞI
+#  A) ETİKET AKIŞI — Qwen
 # ════════════════════════════════════════════════════════════════════════
 
-# Colab'da doğrulanmış OCR promptu — DEĞİŞTİRME
 OCR_PROMPT = """
 ACT AS A HIGH-PRECISION OCR SCANNER.
 Extract ALL visible text from the provided packaging images.
@@ -211,12 +183,12 @@ CRITICAL RULES:
 
 LABEL_STRUCTURE_PROMPT = """You are a food label parser. Below is OCR text from a product package.
 
-Return ONLY a JSON object, no markdown, no commentary:
+Return ONLY a JSON object, no markdown:
 
 {
-  "product_name": "Turkish name with proper characters, or null if unreadable",
+  "product_name": "Turkish name, or null if unreadable",
   "brand": "brand or null",
-  "ingredients": ["array of Turkish ingredient strings, [] if none found"],
+  "ingredients": ["Turkish ingredient strings, [] if none"],
   "allergens": ["ARRAY of keys actually present"],
   "contains_lactose": false,
   "contains_pork": false,
@@ -226,13 +198,12 @@ Return ONLY a JSON object, no markdown, no commentary:
   "expiry_date": "YYYY-MM-DD or null",
   "storage": "one of: Buzdolabı, Dondurucu, Oda Sıcaklığı, Kiler",
   "nutrition": {
-    "serving": "per 100g / per portion, or null",
-    "energy_kcal": null, "fat_g": null, "saturated_fat_g": null,
-    "carbs_g": null, "sugar_g": null, "protein_g": null,
-    "salt_g": null, "fiber_g": null
+    "serving": null, "energy_kcal": null, "fat_g": null,
+    "saturated_fat_g": null, "carbs_g": null, "sugar_g": null,
+    "protein_g": null, "salt_g": null, "fiber_g": null
   },
   "confidence": 0,
-  "summary": "ONE short Turkish sentence describing the product"
+  "summary": "ONE short Turkish sentence"
 }
 
 Rules:
@@ -241,8 +212,7 @@ Rules:
   With milk and hazelnut: ["sut","findik"]. With none: [].
   NEVER an object with true/false. ALWAYS an array of strings.
 - contains_pork: domuz, jambon, bacon, lard, unknown-origin gelatin.
-- nutrition: read numbers from the nutritional table. Missing → null.
-  Numbers only, no units.
+- nutrition: read numbers from the table. Missing → null. Numbers only, no units.
 - confidence: 0-100, how readable the label was.
 
 OCR TEXT:
@@ -254,22 +224,16 @@ async def analyze_label(
     images: list[UploadFile] = File(...),
     x_app_key: Optional[str] = Header(None),
 ):
-    """
-    ÜRÜN ETİKETİ — içindekiler okuma.
-    1) Qwen saf OCR (layout korunur)
-    2) Aynı metni yapılandırılmış JSON'a çevir
-    raw_text daima döner — /product-chat kalori sorularında bunu kullanır.
-    """
+    """ETİKET — Qwen OCR (düz metin) → Qwen yapılandırma (JSON)."""
     check_auth(x_app_key)
     log.info(f"[LABEL] {len(images)} image(s)")
 
     try:
-        uris = [await to_data_uri(i) for i in images[:MAX_LABEL_IMAGES]]
+        imgs = [await read_image(i) for i in images[:MAX_LABEL_IMAGES]]
 
         raw_text = strip_think(
-            groq_chat("vision", VISION_MODELS,
-                      vision_message(OCR_PROMPT, uris),
-                      temperature=0.0, max_tokens=2500)
+            qwen(qwen_vision_message(OCR_PROMPT, imgs),
+                 temperature=0.0, max_tokens=4000)
         )
         log.info(f"[LABEL] OCR {len(raw_text)} chars")
 
@@ -282,24 +246,21 @@ async def analyze_label(
                 "confidence": 0, "summary": "Etiket okunamadı.", "raw_text": "",
             }}
 
-        structured = parse_json_loose(
-            groq_chat("label_struct", PRODUCT_CHAT_MODELS,
-                      [{"role": "user",
-                        "content": LABEL_STRUCTURE_PROMPT + raw_text[:6000]}],
-                      temperature=0.1, json_mode=True)
+        data = parse_json_loose(
+            qwen([{"role": "user",
+                   "content": LABEL_STRUCTURE_PROMPT + raw_text[:6000]}],
+                 temperature=0.1, json_mode=True)
         )
 
-        al = structured.get("allergens")
+        al = data.get("allergens")
         if isinstance(al, dict):
-            structured["allergens"] = [k for k, v in al.items() if v is True]
-            log.warning("[LABEL] allergens was object → converted to array")
+            data["allergens"] = [k for k, v in al.items() if v is True]
         elif not isinstance(al, list):
-            structured["allergens"] = []
+            data["allergens"] = []
 
-        structured["raw_text"] = raw_text[:6000]
-        log.info(f"[LABEL] name={structured.get('product_name')} "
-                 f"conf={structured.get('confidence')}")
-        return {"status": "success", "data": structured}
+        data["raw_text"] = raw_text[:6000]
+        log.info(f"[LABEL] name={data.get('product_name')} conf={data.get('confidence')}")
+        return {"status": "success", "data": data}
 
     except HTTPException:
         raise
@@ -313,26 +274,20 @@ async def product_chat(
     request: ProductChatRequest,
     x_app_key: Optional[str] = Header(None),
 ):
-    """
-    ÜRÜN SOHBETİ — aynı Qwen modeli, kendi OCR çıktısını yorumlar.
-    SADECE taranan ürün. Tarif önermez, dolaptan bahsetmez.
-    """
+    """ÜRÜN SOHBETİ — Qwen, kendi OCR çıktısını yorumlar. Sadece bu ürün."""
     check_auth(x_app_key)
 
     try:
         p = request.product or {}
         summary = json.dumps({
-            "name": p.get("product_name"),
-            "brand": p.get("brand"),
+            "name": p.get("product_name"), "brand": p.get("brand"),
             "ingredients": (p.get("ingredients") or [])[:30],
             "allergens": p.get("allergens") or [],
             "contains_lactose": p.get("contains_lactose"),
             "contains_pork": p.get("contains_pork"),
             "contains_alcohol": p.get("contains_alcohol"),
-            "category": p.get("category"),
-            "net_weight": p.get("net_weight"),
-            "storage": p.get("storage"),
-            "expiry_date": p.get("expiry_date"),
+            "category": p.get("category"), "net_weight": p.get("net_weight"),
+            "storage": p.get("storage"), "expiry_date": p.get("expiry_date"),
             "nutrition": p.get("nutrition") or {},
         }, ensure_ascii=False)
 
@@ -346,7 +301,7 @@ STRUCTURED DATA:
 {summary}
 
 FULL LABEL TEXT (as printed — use this for calories, nutrition table,
-weights, dates and anything not in the structured data above):
+weights and dates):
 ---
 {raw}
 ---
@@ -358,19 +313,15 @@ USER PROFILE:
 Rules:
 1. Answer ONLY about this product: ingredients, nutrition, calories, allergens,
    storage, weight, dates, and whether it fits the user's profile.
-2. For calories or nutrition, read the FULL LABEL TEXT above. If a value is not
-   printed there, say it is not on the label — never invent a number.
-3. If asked whether it suits them, compare against the profile and answer clearly:
-   uygun / uygun değil / emin değilim — and name the exact ingredient that decides it.
-4. NEVER suggest recipes. NEVER mention the fridge or inventory. NEVER offer to
-   add this product anywhere.
-5. State facts only. No medical or nutrition advice.
-   Say "Bu üründe süt var", never "sağlığınız için kaçının".
-6. If the label was unreadable, say so honestly and suggest rescanning closer
-   with better lighting.
+2. For calories or nutrition read the FULL LABEL TEXT. If a value is not printed
+   there, say it is not on the label — never invent a number.
+3. If asked whether it suits them, answer clearly uygun / uygun değil /
+   emin değilim and name the exact ingredient that decides it.
+4. NEVER suggest recipes. NEVER mention the fridge. NEVER offer to add it anywhere.
+5. Facts only. No medical or nutrition advice.
+6. If the label was unreadable, say so and suggest rescanning closer.
 7. Out of scope → "Ben taradığınız ürün hakkında yardımcı olabilirim."
-8. Short: 2-4 sentences. This is a phone screen.
-9. No <think> tags, no internal reasoning in the output.
+8. Short: 2-4 sentences. No <think> tags.
 
 Always answer in Turkish."""
 
@@ -380,10 +331,7 @@ Always answer in Turkish."""
                 messages.append({"role": m.role, "content": m.content[:600]})
         messages.append({"role": "user", "content": request.user_message})
 
-        reply = strip_think(
-            groq_chat("product_chat", PRODUCT_CHAT_MODELS, messages, temperature=0.3)
-        )
-        return {"status": "success", "reply": reply}
+        return {"status": "success", "reply": strip_think(qwen(messages, 0.3))}
 
     except HTTPException:
         raise
@@ -393,7 +341,7 @@ Always answer in Turkish."""
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  B) BUZDOLABI AKIŞI
+#  B) DOLAP AKIŞI — Gemini görüntü + Qwen sohbet
 # ════════════════════════════════════════════════════════════════════════
 
 FRIDGE_PROMPT = """You are looking INSIDE a refrigerator or at grocery items.
@@ -402,20 +350,19 @@ Identify every distinct food item, drink and package visible across the images.
 Read visible labels to name products accurately. If the same item appears in more
 than one image, count it once.
 
-Return ONLY a JSON object, no markdown:
+Return ONLY a JSON object, no markdown, no commentary:
 
 {"items":[{"name":"Domates","category":"Sebze","freshness_points":80,"quantity":5,"unit":"adet"}]}
 
 Rules:
-- name: Turkish, proper characters (Süt not Sut). Be specific when the label is
-  readable, e.g. "Laktozsuz Süt" rather than just "Süt".
+- name: Turkish with proper characters (Süt not Sut). Be specific when the label
+  is readable, e.g. "Laktozsuz Süt" rather than just "Süt".
 - category: exactly one of Sebze, Meyve, Süt Ürünleri, Protein, Tahıl, İçecek,
   Baharat, Donuk, Diğer
-- freshness_points: 0-100, how fresh the item LOOKS (colour, wilting, packaging
-  condition, visible mould). Cannot judge visually → 85. This is NOT shelf life.
+- freshness_points: 0-100, how fresh it LOOKS (colour, wilting, packaging).
+  Cannot judge → 85. This is NOT shelf life.
 - quantity: a number. unit: adet, paket, kap, gram, ml, kg or litre.
-- Do not list shelves, containers or the fridge itself. Food and drink only.
-- No <think> tags, no commentary.
+- Food and drink only. Do not list shelves, containers or the fridge itself.
 """
 
 
@@ -424,19 +371,16 @@ async def analyze_fridge(
     images: list[UploadFile] = File(...),
     x_app_key: Optional[str] = Header(None),
 ):
-    """BUZDOLABI — envantere eklenecek ürünleri sayar. Etiket akışıyla ilgisi yok."""
+    """DOLAP — Gemini 3.6 Flash ile ürün tanıma."""
     check_auth(x_app_key)
     log.info(f"[FRIDGE] {len(images)} image(s)")
 
     try:
-        uris = [await to_data_uri(i) for i in images[:MAX_FRIDGE_IMAGES]]
+        imgs = [await read_image(i) for i in images[:MAX_FRIDGE_IMAGES]]
+        raw = gemini_vision(FRIDGE_PROMPT, imgs)
+        log.info(f"[FRIDGE] gemini raw: {raw[:400]}")
 
-        data = parse_json_loose(
-            groq_chat("vision", VISION_MODELS,
-                      vision_message(FRIDGE_PROMPT, uris),
-                      temperature=0.1, json_mode=True)
-        )
-
+        data = parse_json_loose(raw)
         items = data.get("items") or []
         log.info(f"[FRIDGE] detected {len(items)} items")
         return {"status": "success", "data": {"items": items}}
@@ -448,7 +392,7 @@ async def analyze_fridge(
         raise HTTPException(500, f"{type(e).__name__}: {e}")
 
 
-# ── Tarif veri seti (Türkçe alan adları) ────────────────────────────────
+# ── Tarif veri seti (Türkçe alanlar) ────────────────────────────────────
 
 def load_recipes() -> list:
     global _RECIPES_CACHE
@@ -497,20 +441,15 @@ def core_ingredients(names: list) -> list:
 
 
 MEAT = {"et", "kiyma", "tavuk", "hindi", "kuzu", "dana", "balik", "sucuk",
-        "pastirma", "salam", "sosis", "ciger", "kusbasi", "but", "kanat",
-        "midye", "karides"}
+        "pastirma", "salam", "sosis", "ciger", "kusbasi", "but", "kanat"}
 DAIRY = {"sut", "peynir", "yogurt", "kaymak", "krema", "tereyagi", "labne",
          "ayran", "kasar", "lor", "cokelek"}
 ANIMAL = MEAT | DAIRY | {"yumurta", "jelatin"}
-HARAM = {"domuz", "jambon", "bacon", "alkol", "sarap", "likor", "rom",
-         "bira", "votka", "konyak"}
+HARAM = {"domuz", "jambon", "bacon", "alkol", "sarap", "likor", "rom", "bira"}
 
 
 def has_any(ings_norm: list, words: set) -> bool:
-    for ing in ings_norm:
-        if ing in words or set(ing.split()) & words:
-            return True
-    return False
+    return any(i in words or set(i.split()) & words for i in ings_norm)
 
 
 def passes_diet(ings: list, prefs: set) -> bool:
@@ -527,30 +466,19 @@ def passes_diet(ings: list, prefs: set) -> bool:
 
 
 def slim(r: dict) -> dict:
-    return {
-        "name": r_name(r),
-        "category": r_category(r),
-        "ingredients": r_ingredients(r)[:12],
-        "minutes": r.get("pisirme_suresi_dk"),
-        "difficulty": r.get("zorluk"),
-    }
+    return {"name": r_name(r), "category": r_category(r),
+            "ingredients": r_ingredients(r)[:12],
+            "minutes": r.get("pisirme_suresi_dk"), "difficulty": r.get("zorluk")}
 
 
-# ── Niyet çıkarımı — modelin kendisi anlar ──────────────────────────────
+# ── Niyet çıkarımı — Qwen ───────────────────────────────────────────────
 
 INTENT_PROMPT = """Extract the user's cooking intent from their message.
-Use the recent conversation for context (e.g. "another one" refers to the
-previous suggestion).
+Use the recent conversation for context.
 
 Return ONLY JSON:
-{
-  "want_categories": [],
-  "exclude_categories": [],
-  "must_ingredients": [],
-  "exclude_ingredients": [],
-  "max_minutes": null,
-  "wants_different": false
-}
+{"want_categories":[],"exclude_categories":[],"must_ingredients":[],
+ "exclude_ingredients":[],"max_minutes":null,"wants_different":false}
 
 The database has EXACTLY these 8 categories. Use ONLY these strings,
 never invent others:
@@ -559,16 +487,16 @@ never invent others:
 
 Guidance:
 - "tatlı istemiyorum", "şekerli olmasın" → exclude_categories: ["tatlı"]
-- "yemek istiyorum", "akşam yemeği", "öğle yemeği" → want_categories: ["ana yemek"]
+- "yemek istiyorum", "akşam yemeği" → want_categories: ["ana yemek"]
 - "çorba istiyorum" → want_categories: ["çorba"]
-- "hafif bir şey", "salata" → want_categories: ["salata"]
+- "hafif bir şey" → want_categories: ["salata"]
 - "kahvaltılık" → want_categories: ["kahvaltı"]
 - "domatesli bir şey" → must_ingredients: ["domates"]
 - "etsiz olsun" → exclude_ingredients: ["et","kıyma","tavuk"]
 - "hızlı olsun" → max_minutes: 30 ; "15 dakikada" → max_minutes: 15
-- "başka bir tarif", "bunu istemiyorum" → wants_different: true
+- "başka bir tarif" → wants_different: true
 - Nothing specific → all empty/null.
-Output Turkish, lowercase, no explanation.
+Turkish, lowercase, no explanation.
 """
 
 
@@ -580,26 +508,22 @@ def empty_intent() -> dict:
 def extract_intent(user_message: str, history: list) -> dict:
     try:
         ctx = "\n".join(f"{m.role}: {m.content[:200]}" for m in history[-4:])
-        out = groq_chat(
-            "intent", INTENT_MODELS,
-            [{"role": "user",
-              "content": f"{INTENT_PROMPT}\n\nRecent conversation:\n{ctx}\n\n"
-                         f"User message: {user_message}"}],
-            temperature=0.0, json_mode=True, max_tokens=300,
-        )
+        out = qwen([{"role": "user",
+                     "content": f"{INTENT_PROMPT}\n\nConversation:\n{ctx}\n\n"
+                                f"User message: {user_message}"}],
+                   temperature=0.0, json_mode=True, max_tokens=300)
         intent = parse_json_loose(out)
         log.info(f"[intent] {json.dumps(intent, ensure_ascii=False)}")
         return {**empty_intent(), **intent}
     except HTTPException:
         raise
     except Exception as e:
-        log.warning(f"[intent] failed, using empty: {e}")
+        log.warning(f"[intent] failed: {e}")
         return empty_intent()
 
 
 def find_recipes(fridge_items: list, exclude_names: list,
                  diet_prefs: list, intent: dict) -> str:
-    """Niyet + dolap eşleştirmesi + kategori çeşitliliği."""
     all_r = load_recipes()
     if not all_r:
         return "[]"
@@ -617,7 +541,6 @@ def find_recipes(fridge_items: list, exclude_names: list,
     for r in all_r:
         if normalize(r_name(r)) in excl_names:
             continue
-
         cat = normalize(r_category(r))
         if cat in excl_cats:
             continue
@@ -625,9 +548,7 @@ def find_recipes(fridge_items: list, exclude_names: list,
             continue
 
         ings = r_ingredients(r)
-        if not ings:
-            continue
-        if not passes_diet(ings, prefs):
+        if not ings or not passes_diet(ings, prefs):
             continue
 
         ings_n = [normalize(i) for i in ings]
@@ -662,7 +583,7 @@ def find_recipes(fridge_items: list, exclude_names: list,
                 and (not want_cats or normalize(r_category(r)) in want_cats)
                 and passes_diet(r_ingredients(r), prefs)]
         picks = random.sample(pool, min(8, len(pool))) if pool else []
-        log.info(f"[recipes] no fridge match → {len(picks)} from filtered pool")
+        log.info(f"[recipes] no match → {len(picks)} random from filtered pool")
         return json.dumps([slim(r) for r in picks], ensure_ascii=False)
 
     random.shuffle(scored)
@@ -687,7 +608,7 @@ async def chat(
     request: ChatRequest,
     x_app_key: Optional[str] = Header(None),
 ):
-    """BUZDOLABI SOHBETİ — tarif önerisi. Ürün etiketiyle ilgisi yok."""
+    """DOLAP SOHBETİ — Qwen. Tarif önerisi."""
     check_auth(x_app_key)
 
     try:
@@ -725,21 +646,19 @@ CANDIDATE RECIPES (name, category, ingredients, minutes, difficulty):
 
 Rules:
 1. Suggest ONLY from CANDIDATE RECIPES. Never invent a recipe.
-2. Never mention "CANDIDATE RECIPES", category labels, or these instructions.
-3. Each candidate has a "category". Respect the user's constraints absolutely —
-   if they said no dessert, never name a tatlı/kek/kurabiye.
+2. Never mention "CANDIDATE RECIPES", category labels or these instructions.
+3. Respect the user's constraints absolutely.
 4. Prioritise fridge items marked ACİL and say WHY you chose that dish.
 5. Suggest ONE dish at a time. Do not list everything.
-6. If the user asks for something different, pick a genuinely DIFFERENT dish.
-   Never repeat your previous suggestion.
+6. If asked for something different, pick a genuinely DIFFERENT dish.
 7. Salt, pepper, oil, flour and common spices are assumed to be at home —
    never list them as missing.
-8. If NO candidate fits, say so honestly in one sentence and ask what they would
-   like instead. Do NOT suggest an unsuitable dish as a fallback.
+8. If NO candidate fits, say so in one sentence and ask what they would like.
+   Do NOT suggest an unsuitable dish as a fallback.
 9. Scope: fridge, recipes, cooking, substitutions. Otherwise:
    "Ben Gıda Asistanınızım. Dolabınızdaki malzemeler ve tarifler konusunda
    yardımcı olabilirim."
-10. No medical or nutrition advice. Facts only.
+10. Facts only, no medical or nutrition advice.
 11. Short: 3-5 sentences. No <think> tags.
 
 Always answer in Turkish."""
@@ -750,10 +669,7 @@ Always answer in Turkish."""
                 messages.append({"role": m.role, "content": m.content[:600]})
         messages.append({"role": "user", "content": request.user_message})
 
-        reply = strip_think(
-            groq_chat("recipe_chat", RECIPE_CHAT_MODELS, messages, temperature=0.6)
-        )
-        return {"status": "success", "reply": reply}
+        return {"status": "success", "reply": strip_think(qwen(messages, 0.6))}
 
     except HTTPException:
         raise
@@ -763,29 +679,31 @@ Always answer in Turkish."""
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  Sağlık ve tanılama
+#  Tanılama
 # ════════════════════════════════════════════════════════════════════════
 
 @app.get("/")
 def root():
-    return {
-        "status": "success",
-        "message": "Smart Food Backend is running!",
-        "recipes_loaded": len(load_recipes()),
-        "active_models": _working or "none used yet",
-    }
+    return {"status": "success", "message": "Smart Food Backend is running!",
+            "recipes_loaded": len(load_recipes()),
+            "models": {"qwen": QWEN, "gemini_fridge": GEMINI_VISION}}
 
 
 @app.get("/debug/models")
 def debug_models():
-    if not groq_client:
-        raise HTTPException(500, "GROQ_API_KEY not set")
-    try:
-        return {"status": "success",
-                "available": [m.id for m in groq_client.models.list().data]}
-    except Exception as e:
-        log.error(traceback.format_exc())
-        raise HTTPException(500, f"{type(e).__name__}: {e}")
+    out = {}
+    if groq_client:
+        try:
+            out["groq"] = [m.id for m in groq_client.models.list().data]
+        except Exception as e:
+            out["groq_error"] = str(e)
+    if GEMINI_API_KEY:
+        try:
+            out["gemini"] = [m.name for m in genai.list_models()
+                             if "generateContent" in getattr(m, "supported_generation_methods", [])]
+        except Exception as e:
+            out["gemini_error"] = str(e)
+    return out
 
 
 @app.get("/debug/recipe")
@@ -794,14 +712,13 @@ def debug_recipe():
     if not r:
         return {"count": 0}
     s = r[0]
-    return {"count": len(r), "keys": list(s.keys()), "name": r_name(s),
-            "category": r_category(s), "ingredients": r_ingredients(s),
+    return {"count": len(r), "name": r_name(s), "category": r_category(s),
+            "ingredients": r_ingredients(s),
             "core": core_ingredients(r_ingredients(s)), "slim": slim(s)}
 
 
 @app.get("/debug/categories")
 def debug_categories():
-    """Veri setindeki gerçek kategori adları — niyet promptunu buna göre ayarla."""
     counts = {}
     for r in load_recipes():
         c = r_category(r)
@@ -810,13 +727,12 @@ def debug_categories():
 
 
 @app.get("/debug/intent")
-def debug_intent(q: str = "tatlı istemiyorum, domatesli bir şey olsun"):
+def debug_intent(q: str = "tatlı istemiyorum"):
     return {"message": q, "intent": extract_intent(q, [])}
 
 
 @app.get("/debug/match")
-def debug_match(items: str = "domates,sogan,yumurta", q: str = ""):
-    """/debug/match?items=domates,kiyma&q=tatlı istemiyorum"""
+def debug_match(items: str = "domates,sogan", q: str = ""):
     fridge = [i.strip() for i in items.split(",") if i.strip()]
     intent = extract_intent(q, []) if q else empty_intent()
     return {"fridge": fridge, "intent": intent,
