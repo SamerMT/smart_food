@@ -44,8 +44,8 @@ QWEN = "qwen/qwen3.6-27b"              # OCR + tüm sohbetler + niyet
 GEMINI_VISION = "models/gemini-3.6-flash"   # sadece buzdolabı
 
 _RECIPES_CACHE = None
-MAX_LABEL_IMAGES = 5
-MAX_FRIDGE_IMAGES = 4
+MAX_LABEL_IMAGES = 2      # Qwen 3 destekliyor ama TPM 8000 limiti 2'ye zorluyor
+MAX_FRIDGE_IMAGES = 4     # Gemini — limit yok
 
 
 # ── Şemalar ─────────────────────────────────────────────────────────────
@@ -129,7 +129,7 @@ def qwen(messages: list, temperature: float = 0.3,
         return res.choices[0].message.content or ""
     except Exception as e:
         msg = str(e)
-        if "429" in msg or "rate limit" in msg.lower():
+        if "429" in msg or "413" in msg or "rate limit" in msg.lower():
             log.warning(f"[qwen] RATE LIMIT: {msg[:200]}")
             raise HTTPException(
                 429, "Günlük yapay zeka kotası doldu. Lütfen daha sonra tekrar deneyin.")
@@ -233,7 +233,7 @@ async def analyze_label(
 
         raw_text = strip_think(
             qwen(qwen_vision_message(OCR_PROMPT, imgs),
-                 temperature=0.0, max_tokens=4000)
+                 temperature=0.0, max_tokens=2000)
         )
         log.info(f"[LABEL] OCR {len(raw_text)} chars")
 
@@ -258,7 +258,7 @@ async def analyze_label(
         elif not isinstance(al, list):
             data["allergens"] = []
 
-        data["raw_text"] = raw_text[:6000]
+        data["raw_text"] = raw_text[:5000]
         log.info(f"[LABEL] name={data.get('product_name')} conf={data.get('confidence')}")
         return {"status": "success", "data": data}
 
@@ -508,10 +508,7 @@ def empty_intent() -> dict:
 def extract_intent(user_message: str, history: list) -> dict:
     try:
         ctx = "\n".join(f"{m.role}: {m.content[:200]}" for m in history[-4:])
-        out = qwen([{"role": "user",
-                     "content": f"{INTENT_PROMPT}\n\nConversation:\n{ctx}\n\n"
-                                f"User message: {user_message}"}],
-                   temperature=0.0, json_mode=True, max_tokens=300)
+        
         intent = parse_json_loose(out)
         log.info(f"[intent] {json.dumps(intent, ensure_ascii=False)}")
         return {**empty_intent(), **intent}
@@ -596,7 +593,7 @@ def find_recipes(fridge_items: list, exclude_names: list,
             continue
         seen[c] = seen.get(c, 0) + 1
         top.append(slim(r))
-        if len(top) >= 12:
+        if len(top) >= 8:
             break
 
     log.info(f"[recipes] {len(scored)} matched → {len(top)} sent, cats={list(seen)}")
