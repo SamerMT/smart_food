@@ -474,3 +474,10 @@ Always answer in Turkish."""
     except Exception as e:
         log.error("[chat] FAILED\n" + traceback.format_exc())
         raise HTTPException(500, f"{type(e).__name__}: {e}")
+
+# test
+@app.get("/debug/recipe")
+def debug_recipe():
+    r = load_recipes()
+    return {"count": len(r), "sample": r[0] if r else None,
+            "keys": list(r[0].keys()) if r else []}
