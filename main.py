@@ -252,8 +252,16 @@ async def analyze_label(
     try:
         imgs = [await read_image(i) for i in images[:MAX_LABEL_IMAGES]]
 
-        raw_text = qwen_ocr(qwen_vision_message(OCR_PROMPT, imgs), max_tokens=2000)
-        log.info(f"[LABEL] OCR {len(raw_text)} chars")
+        try:
+            raw_text = qwen_ocr(qwen_vision_message(OCR_PROMPT, imgs), max_tokens=2500)
+            log.info(f"[LABEL] Qwen OCR {len(raw_text)} chars")
+        except HTTPException as e:
+            if e.status_code == 429 and GEMINI_API_KEY:
+                log.warning("[LABEL] Qwen limit asildi → Gemini yedegi")
+                raw_text = strip_think(gemini_vision(OCR_PROMPT, imgs))
+                log.info(f"[LABEL] Gemini OCR {len(raw_text)} chars")
+            else:
+                raise
 
         if not raw_text.strip():
             return {"status": "success", "data": {
